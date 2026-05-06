@@ -1055,7 +1055,10 @@ async def test_campaign(campaign_id: int, subscribers: list[str]) -> str:
 
     Args:
         campaign_id: ID of the campaign to test.
-        subscribers: One or more recipient email addresses for the test send.
+        subscribers: Recipient emails. IMPORTANT: each must already exist as a
+            subscriber on this listmonk instance (the test handler looks them
+            up by email and skips unknown addresses). Add them via
+            add_subscriber first if needed.
     """
     async def _test_campaign_logic() -> str:
         client = get_client()

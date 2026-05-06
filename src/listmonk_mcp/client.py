@@ -604,8 +604,35 @@ class ListmonkClient:
         campaign_id: int,
         subscribers: list[str],
     ) -> dict[str, Any]:
-        """Send a test of the campaign to one or more subscriber emails."""
-        data = {"subscribers": subscribers}
+        """Send a test of the campaign to one or more subscriber emails.
+
+        Listmonk's test endpoint validates the full campaign payload
+        (name/subject/lists/body/messenger/content_type), so we fetch the
+        saved campaign and merge those fields into the test request — same
+        pattern as update_campaign.
+
+        Note: recipients must already exist as subscribers in listmonk;
+        the test handler looks them up by email and silently sends nothing
+        if no record matches.
+        """
+        current = await self.get_campaign(campaign_id)
+        camp = current.get("data", {})
+
+        data: dict[str, Any] = {
+            "name": camp.get("name", ""),
+            "subject": camp.get("subject", ""),
+            "lists": [lst.get("id") for lst in camp.get("lists", []) if lst.get("id")],
+            "from_email": camp.get("from_email", ""),
+            "body": camp.get("body", ""),
+            "altbody": camp.get("altbody") or "",
+            "content_type": camp.get("content_type", "richtext"),
+            "messenger": camp.get("messenger", "email"),
+            "type": camp.get("type", "regular"),
+            "tags": camp.get("tags", []) or [],
+            "template_id": camp.get("template_id", 0),
+            "headers": camp.get("headers", []) or [],
+            "subscribers": subscribers,
+        }
         return await self._request("POST", f"/api/campaigns/{campaign_id}/test", json_data=data)
 
     async def change_campaign_status(self, campaign_id: int, status: str) -> dict[str, Any]:
