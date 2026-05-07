@@ -76,7 +76,7 @@ class ListmonkClient:
         method: str,
         endpoint: str,
         params: dict[str, Any] | None = None,
-        json_data: dict[str, Any] | None = None,
+        json_data: Any = None,
         retry_count: int = 0
     ) -> dict[str, Any]:
         """Make HTTP request with retry logic and error handling."""
@@ -780,8 +780,15 @@ class ListmonkClient:
         return await self._request("PUT", "/api/settings", json_data=settings)
 
     async def update_setting(self, key: str, value: Any) -> dict[str, Any]:
-        """Update a single settings key (avoids the password-masking footgun)."""
-        return await self._request("PUT", f"/api/settings/{key}", json_data={"value": value})
+        """Update a single settings key (avoids the password-masking footgun).
+
+        Listmonk's per-key settings handler reads the request body as a raw
+        JSON value and writes it directly into the settings document — so
+        the body must be the value itself (e.g. a JSON string for a string
+        setting), NOT wrapped in {"value": ...}. Wrapping causes listmonk
+        to store the whole object and breaks the field.
+        """
+        return await self._request("PUT", f"/api/settings/{key}", json_data=value)
 
     async def test_smtp_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
         """Send a test email through provided SMTP settings."""
