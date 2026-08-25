@@ -22,16 +22,28 @@ as-is.
 
 ## The default branch is `master`, not `main`
 
-The rest of the fleet uses `main`. Two things follow:
+The rest of the fleet uses `main`. **Every ref guard in
+`.forgejo/workflows/ci.yml` must say `master`.** Copying a `main` guard in from
+`caldav-mcp` or `jmap-mcp` disables it silently: the condition simply never
+fires, and nothing reports an error. `scripts/check_buildcache_guard.py` fails
+on a literal `refs/heads/main` anywhere in the workflow for exactly this reason.
 
-- **Every ref guard in `.forgejo/workflows/ci.yml` must say `master`.** Copying
-  a `main` guard in from `caldav-mcp` or `jmap-mcp` disables it silently: the
-  condition simply never fires, and nothing reports an error.
-  `scripts/check_buildcache_guard.py` fails on a literal `refs/heads/main`
-  anywhere in the workflow for exactly this reason.
-- **`forge.sh new` cannot create a worktree here.** It hardcodes `origin/main`.
-  Make worktrees by hand until that is fixed; it is a defect in `forge.sh`, not
-  in this repo.
+## `.forgejo/workflows` shadows `.github/workflows`
+
+This repository carries both. The `.github` ones are upstream's — a PyPI
+publish and a GitHub Pages docs build — and **neither runs here, nor should
+they be deleted.**
+
+Forgejo reads `.forgejo/workflows` and ignores `.github/workflows` entirely
+once the former exists. That is established by observation rather than
+documentation: `caldav-mcp` carries both, its `.github/workflows/ci.yml`
+declares jobs `quality` and `container`, and across every task record on that
+repository the only job names that have ever run are `cargo` and `docker`.
+
+So deleting `.github/workflows` buys nothing and costs fork divergence and a
+merge conflict against upstream. A red `Deploy Docs` on a pull request whose
+head predates `.forgejo/` is expected and resolves itself once `.forgejo/` is
+in the tree.
 
 ## Deployment contract
 
