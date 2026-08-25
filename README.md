@@ -60,6 +60,51 @@ cd listmonk-mcp
 uv sync --extra dev
 ```
 
+## Transports
+
+The server speaks two transports. `stdio` is the default and is how a local MCP
+client runs it.
+
+```bash
+# stdio (default)
+listmonk-mcp
+
+# streamable-HTTP
+LISTMONK_MCP_TRANSPORT=streamable-http listmonk-mcp
+# or
+listmonk-mcp --transport streamable-http
+```
+
+Under `streamable-http` the server opens two listeners:
+
+| | default | carries | env override |
+|---|---|---|---|
+| public | `0.0.0.0:3000` | `/mcp`, `/health` | `LISTMONK_MCP_BIND_ADDR` |
+| internal | `127.0.0.1:9090` | `/metrics` | `LISTMONK_MCP_METRICS_BIND_ADDR` |
+
+The metrics listener resolves its address as: explicit env, then `{POD_IP}:9090`,
+then `127.0.0.1:9090`. It never defaults to `0.0.0.0`, because `/metrics` must
+not be reachable through the same Service that carries `/mcp`.
+
+## Container image
+
+```bash
+docker build \
+  --build-arg BUILD_VERSION=0.2.0 \
+  --build-arg BUILD_REVISION="$(git rev-parse HEAD)" \
+  --build-arg BUILD_CREATED="$(git show -s --format=%cI HEAD)" \
+  -t listmonk-mcp:dev .
+
+docker run --rm -p 3000:3000 \
+  -e LISTMONK_MCP_URL=http://listmonk:9000 \
+  -e LISTMONK_MCP_USERNAME=api-user \
+  -e LISTMONK_MCP_PASSWORD=... \
+  listmonk-mcp:dev
+```
+
+The image defaults `LISTMONK_MCP_TRANSPORT` to `streamable-http` and runs as UID
+65532. Port 9090 is deliberately not `EXPOSE`d.
+
 ## Development
 
 ### Code Quality Checks
@@ -71,16 +116,22 @@ Run the same checks that are executed in the CI/CD pipeline:
 uv sync --extra dev
 
 # Run linting (same as CI)
-uv run ruff check src/
+uv run ruff check src/ tests/ scripts/
 
 # Auto-fix linting issues
-uv run ruff check src/ --fix
+uv run ruff check src/ tests/ scripts/ --fix
 
 # Run type checking (same as CI)
-uv run mypy src/
+uv run mypy src/ scripts/
+
+# Run the test suite (same as CI)
+uv run pytest
 
 # Run all checks together
-uv run ruff check src/ && uv run mypy src/
+uv run ruff check src/ tests/ scripts/ \
+  && uv run mypy src/ scripts/ \
+  && uv run pytest \
+  && uv run python scripts/check_buildcache_guard.py
 ```
 
 ### Building and Testing
