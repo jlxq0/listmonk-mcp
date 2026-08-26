@@ -56,6 +56,14 @@ read it. Keys were not enough either — a fifth pass produced
 `runs-on: <label-no-runner-has>`, which keeps every allowed key and schedules
 nothing — so whole mappings are pinned by value. The named checks above are
 kept for what they explain, not for what they catch.
+
+Where this stops. The property defended here is that the workflow cannot report
+success while having built nothing or exported twice. A sixth pass proposed
+`exit 1` in the `Install buildctl` step, which does stop the build — and turns
+the run red, which is reported by the CI status itself and blocks the merge. It
+is out of scope by construction, and so is every other edit whose effect is a
+failing job. Only silent breaks belong here. `continue-on-error: true`, which
+would convert a red run into a green one, is refused by the job-header pin.
 """
 
 from __future__ import annotations
