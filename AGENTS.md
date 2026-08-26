@@ -150,6 +150,24 @@ canned JSON is enough to exercise both transports end to end.
 
 Each of these shipped broken at least once, or would have.
 
+**A new repository in this fleet has no `FORGE_PUSH_TOKEN`, and no pull request
+will tell you.** The registry-login step is guarded
+`if: github.event_name != 'pull_request'`, because a pull request has no
+credentials to log in with — so every pull-request `docker` job is green while
+the secret is absent. The first push to `master` is the first run that logs in
+and the first that exports the layer cache, and it fails there.
+
+That is what happened on `d74a768`, the merge of #3: `python` green, `docker`
+red, on a repository whose five siblings all carried the secret and which had
+never had one set. It would have failed the release tag too, which pushes the
+image.
+
+The token is the `jlxq0` CI bot (`repository:Read` + `package:Read/Write`),
+already provisioned; the gap was this repository's secret, not the credential.
+Set it before the first merge to `master`, and read
+`GET /repos/{owner}/{repo}/actions/secrets` against a sibling repository rather
+than trusting that a green pull request means the build path works.
+
 **`uv sync` installs the project editable by default.** In a multi-stage image
 that leaves a `.pth` pointing at the builder's source directory, which does not
 exist in the runtime stage. The container starts and dies with
