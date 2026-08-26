@@ -156,6 +156,22 @@ canned JSON is enough to exercise both transports end to end.
 
 Each of these shipped broken at least once, or would have.
 
+**The declared Python floor is type-checked and never run.** `pyproject`
+declares `requires-python = ">=3.11"`; `.python-version` pins 3.13, uv honours
+it, and the Dockerfile pins `python:3.13-slim-bookworm` by digest, so CI and
+the image agree with each other and neither exercises 3.11. mypy is configured
+at `python_version = "3.11"`, which type-checks the floor and executes nothing.
+
+Checked rather than assumed on 2026-08-26: the suite passes on 3.11.15, all 66
+tests, in a throwaway venv. So the declaration is true today — it is simply not
+a thing CI can keep true, and a change that needs 3.12+ would land green.
+
+No 3.11 job was added: exercising a version nobody in this fleet runs buys less
+than the noise costs. The alternative, raising the floor to 3.13, is not taken
+because this is a fork of a package upstream publishes to PyPI at `>=3.11`, and
+narrowing that is divergence to carry or send up rather than a local tidy. If
+the floor ever stops being true, raise it — do not leave it declared.
+
 **A new repository in this fleet has no `FORGE_PUSH_TOKEN`, and no pull request
 will tell you.** The registry-login step is guarded
 `if: github.event_name != 'pull_request'`, because a pull request has no
