@@ -21,8 +21,8 @@ What does work is running the guard. This script pulls the `docker` job's build
 script out of the YAML, runs it under four refs with `buildctl` stubbed, and
 counts the `--export-cache` arguments it was actually invoked with.
 
-It then re-runs itself against fourteen deliberately broken variants — three of
-the build script, eleven of the workflow that reaches it — and requires each to
+It then re-runs itself against fifteen deliberately broken variants — three of
+the build script, twelve of the workflow that reaches it — and requires each to
 be rejected. A check that has never failed is a hypothesis; this one fails on
 every CI run, on purpose.
 
@@ -50,10 +50,12 @@ run unconditionally are named.
 
 Naming faults one at a time does not terminate. Four cross-engine passes over
 this file produced four different keys and each fix invited the next, so the
-last check is fail-closed rather than specific: the workflow may carry the keys
-it carries today and nothing else, and a new one is a failure until someone has
-read it. The named checks above are kept for what they explain, not for what
-they catch.
+last check is fail-closed rather than specific: the workflow may carry what it
+carries today and nothing else, and anything new is a failure until someone has
+read it. Keys were not enough either — a fifth pass produced
+`runs-on: <label-no-runner-has>`, which keeps every allowed key and schedules
+nothing — so whole mappings are pinned by value. The named checks above are
+kept for what they explain, not for what they catch.
 """
 
 from __future__ import annotations
@@ -282,13 +284,19 @@ UNCONDITIONAL_STEPS: Final = (
 # ruled it harmless here or written the specific check. `needs: nonexistent`
 # never schedules the docker job and is a key that already exists, which is why
 # the value is pinned and not only the key.
-ALLOWED_JOB_KEYS: Final = {
-    "python": {"runs-on", "steps"},
-    DOCKER_JOB: {"needs", "permissions", "runs-on", "steps"},
+# Keys were not enough: `runs-on: some-label-no-runner-has` keeps the key and
+# never schedules the job. So these pin whole mappings by value, everything
+# except the parts with their own checks — a job's `steps`, a step's `run`.
+EXPECTED_JOB_HEADER: Final = {
+    "python": {"runs-on": "ubuntu-22.04"},
+    DOCKER_JOB: {
+        "runs-on": "ubuntu-22.04",
+        "needs": "python",
+        "permissions": {"contents": "read", "packages": "write"},
+    },
 }
+EXPECTED_PUSH: Final = {"branches": [DEFAULT_BRANCH], "tags": ["v*"]}
 DOCKER_NEEDS: Final = "python"
-ALLOWED_PUSH_KEYS: Final = {"branches", "tags"}
-ALLOWED_STEP_KEYS: Final = {"name", "run"}
 
 
 def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
@@ -399,36 +407,36 @@ def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
 def check_no_unread_keys(
     name: str, push: dict[str, object] | str, jobs: object
 ) -> list[str]:
-    """Fail on any key nobody has read, rather than on a list of known faults.
+    """Fail on anything nobody has read, rather than on a list of known faults.
 
     The named checks above each say why one key is dangerous. This one says
-    nothing about danger: it says the workflow has grown a key that no check
-    here understands, and a check that does not understand a key cannot vouch
-    for it.
+    nothing about danger: it says the workflow carries something no check here
+    understands, and a check that does not understand a value cannot vouch for
+    it. Keys alone were not enough — `runs-on: a-label-no-runner-has` keeps
+    every allowed key and schedules nothing — so whole mappings are pinned by
+    value, minus the parts with their own checks.
     """
     failures: list[str] = []
 
-    if isinstance(push, dict):
-        unread = set(push) - ALLOWED_PUSH_KEYS
-        if unread:
-            failures.append(
-                f"{name}: on.push carries unread key(s) {sorted(unread)}. "
-                "Trigger filters decide whether a push to master runs at all, "
-                "and nothing here knows what this one does. Read it, then "
-                "either allow it explicitly or write the check."
-            )
+    if isinstance(push, dict) and push != EXPECTED_PUSH:
+        failures.append(
+            f"{name}: on.push is {push!r}, expected {EXPECTED_PUSH!r}. Trigger "
+            "filters decide whether a push to master runs at all, and nothing "
+            "here knows what a new one does. Read it, then either widen this "
+            "or write the check."
+        )
 
-    for job_name, allowed in ALLOWED_JOB_KEYS.items():
+    for job_name, expected in EXPECTED_JOB_HEADER.items():
         job = (jobs or {}).get(job_name) if isinstance(jobs, dict) else None
         if not isinstance(job, dict):
             continue  # already reported as a missing job
-        unread = set(job) - allowed
-        if unread:
+        header = {key: value for key, value in job.items() if key != "steps"}
+        if header != expected:
             failures.append(
-                f"{name}: job `{job_name}` carries unread key(s) "
-                f"{sorted(unread)}. Job-level keys decide whether it runs and "
-                "how many instances of it run, which is the whole subject of "
-                "this file."
+                f"{name}: job `{job_name}` header is {header!r}, expected "
+                f"{expected!r}. Everything outside `steps:` decides whether the "
+                "job is scheduled and how many instances run, which is the "
+                "whole subject of this file."
             )
         for step in job.get("steps") or []:
             if not isinstance(step, dict):
@@ -439,13 +447,13 @@ def check_no_unread_keys(
                 if owner == job_name
             }:
                 continue
-            unread_step = set(step) - ALLOWED_STEP_KEYS
-            if unread_step:
+            around = {key: value for key, value in step.items() if key != "run"}
+            if around != {"name": step.get("name")}:
                 failures.append(
                     f"{name}: step {step.get('name')!r} in job `{job_name}` "
-                    f"carries unread key(s) {sorted(unread_step)}. This script "
-                    "runs the step's `run:` block and reads nothing else about "
-                    "it, so anything else on the step is unchecked."
+                    f"carries {around!r} around its `run:` block. This script "
+                    "runs that block and reads nothing else about the step, so "
+                    "anything else on it is unchecked."
                 )
 
     docker_job = (jobs or {}).get(DOCKER_JOB) if isinstance(jobs, dict) else None
@@ -541,6 +549,11 @@ BROKEN_WORKFLOWS: Final[tuple[tuple[str, str, str], ...]] = (
         "a trigger filter no check here has read",
         "    branches: [master]\n",
         "    branches: [master]\n    types: [deleted]\n",
+    ),
+    (
+        "docker job pinned to a runner label that does not exist",
+        "  docker:\n    runs-on: ubuntu-22.04\n",
+        "  docker:\n    runs-on: ubuntu-24.04-arm-nonexistent\n",
     ),
 )
 
