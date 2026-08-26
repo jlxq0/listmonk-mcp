@@ -21,9 +21,18 @@ What does work is running the guard. This script pulls the `docker` job's build
 script out of the YAML, runs it under four refs with `buildctl` stubbed, and
 counts the `--export-cache` arguments it was actually invoked with.
 
-It then re-runs itself against three deliberately broken variants of the same
-script and requires each to be rejected. A check that has never failed is a
-hypothesis; this one fails on every CI run, on purpose.
+It then re-runs itself against six deliberately broken variants — three of the
+build script, three of the workflow that reaches it — and requires each to be
+rejected. A check that has never failed is a hypothesis; this one fails on every
+CI run, on purpose.
+
+The workflow-level cases exist because the script-level ones are not enough. An
+export guard reading `refs/heads/main` is caught; a push trigger reading
+`branches: [main]` was not, because it is not that literal string, and it is the
+worse fault: the workflow never fires on master, nothing is built, the cache is
+never written, and this script stops running. The check that would have caught
+it is the thing the break disables. Two ways of breaking it found that; one
+would have left the guard looking correct.
 """
 
 from __future__ import annotations
@@ -45,7 +54,8 @@ BUILD_STEP_NAME: Final = "Build (and push on tag)"
 DOCKER_JOB: Final = "docker"
 
 # The one ref that may write to the cache, and the refs that must not.
-EXPORTING_REF: Final = "refs/heads/master"
+DEFAULT_BRANCH: Final = "master"
+EXPORTING_REF: Final = f"refs/heads/{DEFAULT_BRANCH}"
 NON_EXPORTING_REFS: Final = (
     "refs/tags/v0.2.0",
     "refs/pull/1/head",
@@ -183,6 +193,26 @@ def check_guard(script: str, tmp: Path) -> list[str]:
     return failures
 
 
+def push_branches(workflow_path: Path) -> object:
+    """The `on.push.branches` list, or a sentinel describing why there is none.
+
+    PyYAML follows YAML 1.1, where the bare key `on:` is the boolean `True`.
+    `document["on"]` raises KeyError and `document.get("on", {})` silently
+    returns an empty mapping — which is how a check of this shape fails open.
+    Read the `True` key.
+    """
+    document = yaml.safe_load(workflow_path.read_text())
+    triggers = document.get(True, document.get("on"))
+    if not isinstance(triggers, dict):
+        return "no `on:` block"
+    push = triggers.get("push")
+    if not isinstance(push, dict):
+        return "no `on.push` block"
+    if "branches" not in push:
+        return "`on.push` has no `branches` filter"
+    return push["branches"]
+
+
 def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
     """Count export sites in the raw YAML, not just the ones a ref reaches."""
     failures: list[str] = []
@@ -200,6 +230,20 @@ def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
         failures.append(
             f"{workflow_path.name}: guards on refs/heads/main. This repository's "
             "default branch is master, so that guard never fires."
+        )
+
+    # The export guard is only reachable if the workflow runs on the branch at
+    # all. `branches: [main]` is not the literal `refs/heads/main`, so the grep
+    # above passes it — while the workflow never fires on master, no image is
+    # built, the cache is never written, and this very script stops running.
+    # The check that would have caught it is the thing the break disables.
+    branches = push_branches(workflow_path)
+    if branches != [DEFAULT_BRANCH]:
+        failures.append(
+            f"{workflow_path.name}: on.push.branches is {branches!r}, expected "
+            f"[{DEFAULT_BRANCH!r}]. This repository's default branch is "
+            f"{DEFAULT_BRANCH}; any other value means the workflow never runs "
+            "on it, so nothing is built and this guard never executes."
         )
 
     return failures
@@ -225,6 +269,57 @@ BROKEN_VARIANTS: Final[tuple[tuple[str, str, str], ...]] = (
         'elif [[ "$GITHUB_REF" == refs/heads/main ]]; then',
     ),
 )
+
+
+# Deliberately broken *workflows*. These are YAML-level breaks that leave the
+# build script untouched, so `check_guard` cannot see them: it runs the script
+# directly and never asks whether a push to master reaches it. `check_static`
+# is the only thing standing between these and a repository with no CI.
+BROKEN_WORKFLOWS: Final[tuple[tuple[str, str, str], ...]] = (
+    (
+        "push trigger copied from a `main` repo, export guard left correct",
+        "branches: [master]",
+        "branches: [main]",
+    ),
+    (
+        "push trigger restricted to a branch that does not exist",
+        "branches: [master]",
+        "branches: [release]",
+    ),
+    (
+        "push trigger's branch filter dropped entirely",
+        "    branches: [master]\n",
+        "",
+    ),
+)
+
+
+def self_test_workflow(workflow_path: Path, tmp: Path) -> list[str]:
+    """Break the workflow YAML three ways and require `check_static` to catch each."""
+    failures: list[str] = []
+    text = workflow_path.read_text()
+    for index, (name, old, new) in enumerate(BROKEN_WORKFLOWS):
+        if old not in text:
+            failures.append(
+                f"self-test {name!r}: anchor {old!r} not found in {workflow_path.name}. "
+                "The workflow changed shape; update this harness rather than "
+                "deleting the case."
+            )
+            continue
+        broken_path = tmp / f"broken-workflow-{index}.yml"
+        broken_path.write_text(text.replace(old, new, 1))
+        caught = check_static(broken_path)
+        if not caught:
+            failures.append(
+                f"self-test {name!r}: harness accepted a workflow it must reject. "
+                "A workflow that never runs on master builds nothing, and this "
+                "check is one of the things it stops running."
+            )
+        else:
+            print(f"  self-test rejected: {name}")
+            for line in caught:
+                print(f"      {line.splitlines()[0]}")
+    return failures
 
 
 def self_test(script: str, tmp: Path) -> list[str]:
@@ -275,6 +370,7 @@ def main() -> int:
         tmp = Path(raw_tmp)
 
         print(f"buildcache guard: {args.workflow}")
+        print(f"  on.push.branches = {push_branches(args.workflow)!r}")
         static_failures = check_static(args.workflow)
 
         print(f"  {EXPORTING_REF}")
@@ -296,6 +392,7 @@ def main() -> int:
         if not args.no_self_test:
             print("self-test (breaking the guard on purpose):")
             failures += self_test(script, tmp)
+            failures += self_test_workflow(args.workflow, tmp)
 
     if failures:
         sys.stdout.flush()

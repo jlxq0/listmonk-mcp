@@ -33,6 +33,31 @@ The rest of the fleet uses `main`. **Every ref guard in
 fires, and nothing reports an error. `scripts/check_buildcache_guard.py` fails
 on a literal `refs/heads/main` anywhere in the workflow for exactly this reason.
 
+**That literal is not the whole surface, and the part it misses is worse.** The
+push trigger's branch filter is `branches: [master]`, which is not the string
+`refs/heads/main`. Changing it to `branches: [main]` — the same copy-from-another-repo
+mistake, one line higher in the same file — left the export guard correct and
+the check passing green, exit 0, printing "OK: exactly one writer to
+:buildcache, on refs/heads/master". It is the worse fault of the two: the
+workflow never fires on `master`, so no image is built, the cache is never
+written, and the guard itself never runs. **The check that would have caught it
+is the thing the break disables.** A guard that passes because the workflow it
+guards no longer runs is worse than the fault it was written for, because the
+green is evidence of nothing and reads as evidence of everything.
+
+It was found by breaking the check **two** ways rather than one. Break one, the
+export guard changed to `refs/heads/main`, was caught: exit 1, four failures.
+Stopping there would have left the guard looking sound. Anything asserting a
+property of this workflow gets broken at every level that can carry the fault,
+not at the level the last bug happened to be on.
+
+`check_static` now asserts `on.push.branches == ["master"]`, and three
+workflow-level breaks run in the self-test on every CI run. **PyYAML follows
+YAML 1.1, so the bare key `on:` parses as the boolean `True`.** `document["on"]`
+raises `KeyError` and `document.get("on", {})` returns an empty mapping and
+passes — which is this same failure shape a third time, in the code that checks
+for it.
+
 ## `.forgejo/workflows` shadows `.github/workflows`
 
 This repository carries both. The `.github` ones are upstream's — a PyPI
