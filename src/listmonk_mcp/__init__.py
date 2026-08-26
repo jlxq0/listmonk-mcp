@@ -1,7 +1,5 @@
 """Listmonk MCP Server package."""
 
-__version__ = "0.1.0"
-
 # Core components
 from .client import ListmonkAPIError, ListmonkClient
 from .config import Config, get_config
@@ -14,7 +12,7 @@ from .models import (
     Template,
     TransactionalEmailModel,
 )
-from .server import mcp
+from .server import __version__, mcp
 
 __all__ = [
     "ListmonkClient",
@@ -26,5 +24,6 @@ __all__ = [
     "Template",
     "TransactionalEmailModel",
     "get_config",
-    "mcp"
+    "mcp",
+    "__version__",
 ]

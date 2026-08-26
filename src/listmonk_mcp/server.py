@@ -1,15 +1,38 @@
 """Listmonk MCP Server using FastMCP framework."""
 
+import asyncio
 import logging
+import os
+import time
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from typing import Any
 
 import typer
 from mcp.server import FastMCP
+from mcp.types import ContentBlock
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
+from . import metrics, transport
 from .client import ListmonkAPIError, ListmonkClient, create_client
 from .config import Config, load_config, validate_config
 from .exceptions import safe_execute_async
+
+__version__ = "0.2.0"
+
+# Set by the container image at build time; see the Dockerfile.
+ENV_BUILD_REVISION = "LISTMONK_MCP_BUILD_REVISION"
+ENV_TRANSPORT = "LISTMONK_MCP_TRANSPORT"
+VALID_TRANSPORTS = frozenset({"stdio", "streamable-http"})
+
+# Single metric label for every tool name that is not registered. See
+# InstrumentedFastMCP.call_tool.
+UNKNOWN_TOOL = "__unknown__"
 
 # Global state
 _client: ListmonkClient | None = None
@@ -22,7 +45,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: Any) -> Any:
-    """Server lifespan context manager."""
+    """Server lifespan context manager.
+
+    Startup and serving are separate ``try`` blocks on purpose. Wrapping the
+    ``yield`` in the startup handler reports every later failure — including one
+    raised while the inner session manager shuts down — as "Failed to start
+    server", which sends whoever reads the log looking at configuration.
+    """
     global _client, _config
 
     try:
@@ -34,36 +63,135 @@ async def lifespan(app: Any) -> Any:
 
         # Create and connect client
         _client = await create_client(_config)
-
-        logger.info("Listmonk MCP Server started successfully")
-        yield
-
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
         raise
+
+    logger.info("Listmonk MCP Server started successfully")
+    try:
+        yield
     finally:
-        # Cleanup
         if _client:
-            await _client.close()
-            logger.info("Listmonk client disconnected")
+            try:
+                await _client.close()
+                logger.info("Listmonk client disconnected")
+            except Exception as e:
+                # Never let a teardown error replace the exception that caused
+                # the shutdown; that exception is the one worth reading.
+                logger.warning(f"Error closing Listmonk client: {e}")
+
+
+class InstrumentedFastMCP(FastMCP):
+    """FastMCP that records a metrics sample per tool call.
+
+    ``call_tool`` is the single choke point every tool dispatch passes through,
+    so instrumenting it here costs one override instead of a decorator on each
+    of the seventy tools — and cannot be forgotten when a tool is added.
+    """
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> Sequence[ContentBlock] | dict[str, Any]:
+        # `name` comes off the wire, so an unregistered one is caller-controlled
+        # and unbounded. Collapsing every miss onto a single label keeps the
+        # metric's cardinality bounded by the tool table, which is the property
+        # the module docstring in `metrics` claims.
+        label = name if self._tool_manager.get_tool(name) is not None else UNKNOWN_TOOL
+        started = time.perf_counter()
+        try:
+            result = await super().call_tool(name, arguments)
+        except Exception:
+            metrics.record_tool_call(label, "error", time.perf_counter() - started)
+            raise
+        metrics.record_tool_call(label, "ok", time.perf_counter() - started)
+        return result
+
+
+def get_version() -> str:
+    """Installed package version, falling back to the in-tree constant."""
+    try:
+        return package_version("listmonk-mcp")
+    except PackageNotFoundError:
+        return __version__
+
+
+def get_revision() -> str:
+    """Git revision baked in at image build time, or ``unknown`` outside one."""
+    return os.environ.get(ENV_BUILD_REVISION, "unknown")
 
 
 # Create a basic MCP server just for decorator registration (no lifespan)
 mcp = FastMCP("Listmonk MCP Server")
 
 
+def _copy_tools(target: FastMCP) -> None:
+    """Copy tools registered on the module-level decorator server onto ``target``."""
+    if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
+        for tool_name, tool_func in mcp._tool_manager._tools.items():
+            target._tool_manager._tools[tool_name] = tool_func
+
+
 def create_production_server() -> FastMCP:
     """Create the production MCP server with lifespan management."""
     # Create a new server with the same tools but with lifespan
-    production_server = FastMCP("Listmonk MCP Server", lifespan=lifespan)
-
-    # Copy all registered tools from the decorator server to production server
-    # Access the tool manager to copy tools properly
-    if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
-        for tool_name, tool_func in mcp._tool_manager._tools.items():
-            production_server._tool_manager._tools[tool_name] = tool_func
-
+    production_server = InstrumentedFastMCP("Listmonk MCP Server", lifespan=lifespan)
+    _copy_tools(production_server)
     return production_server
+
+
+def create_http_server() -> FastMCP:
+    """Create the MCP server used behind the streamable-HTTP transport.
+
+    Deliberately built *without* ``lifespan``. FastMCP threads its lifespan into
+    the low-level ``Server``, which the streamable-HTTP session manager runs
+    once per MCP session — so the Listmonk client would connect and disconnect
+    per client session, and two concurrent sessions would race on the module
+    globals, with the first to finish closing the client the second is still
+    using. Over HTTP the client's lifetime is the process's, so it is managed at
+    the ASGI lifespan instead (see :func:`create_http_app`).
+    """
+    http_server = InstrumentedFastMCP(
+        "Listmonk MCP Server",
+        streamable_http_path="/mcp",
+    )
+    _copy_tools(http_server)
+    return http_server
+
+
+async def health_endpoint(request: Request) -> Response:
+    """Liveness/readiness probe. Public: it carries no Listmonk detail."""
+    return JSONResponse(
+        {
+            "status": "healthy",
+            "version": get_version(),
+            "revision": get_revision(),
+        }
+    )
+
+
+def create_http_app(http_server: FastMCP | None = None) -> Starlette:
+    """Build the public ASGI app: ``/mcp`` plus ``/health``.
+
+    The Listmonk client is opened once for the process, around the session
+    manager's own lifespan, so ``/health`` answers only once the upstream
+    connection has been established and the client is torn down after the last
+    session has ended.
+    """
+    server = http_server if http_server is not None else create_http_server()
+    app = server.streamable_http_app()
+    # Prepended rather than registered via FastMCP.custom_route: the app is
+    # already ours here, and one wiring site is easier to keep true than two.
+    app.router.routes.insert(0, Route("/health", health_endpoint, methods=["GET"]))
+    session_manager_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def combined_lifespan(scope_app: Starlette) -> AsyncIterator[None]:
+        async with lifespan(scope_app):
+            async with session_manager_lifespan(scope_app):
+                yield
+
+    app.router.lifespan_context = combined_lifespan
+    return app
 
 
 def get_client() -> ListmonkClient:
@@ -2303,6 +2431,12 @@ def run(
         "--version",
         "-v",
         help="Show version and exit"
+    ),
+    transport_name: str = typer.Option(
+        None,
+        "--transport",
+        "-t",
+        help="Transport: stdio (default) or streamable-http",
     )
 ) -> None:
     """
@@ -2318,26 +2452,52 @@ def run(
     - LISTMONK_MCP_MAX_RETRIES: Maximum retry attempts (default: 3)
     - LISTMONK_MCP_DEBUG: Enable debug mode (default: false)
     - LISTMONK_MCP_LOG_LEVEL: Logging level (default: INFO)
+
+    Transport selection (streamable-http only):
+    - LISTMONK_MCP_TRANSPORT: stdio (default) or streamable-http
+    - LISTMONK_MCP_BIND_ADDR: public listener (default: 0.0.0.0:3000)
+    - LISTMONK_MCP_METRICS_BIND_ADDR: metrics listener; falls back to
+      {POD_IP}:9090, then 127.0.0.1:9090, and never to 0.0.0.0
     """
     if version:
-        # Import here to avoid circular imports
-        try:
-            from importlib.metadata import version as get_version
-            pkg_version = get_version("listmonk-mcp")
-        except ImportError:
-            pkg_version = "0.0.1"  # fallback
-        typer.echo(f"listmonk-mcp {pkg_version}")
+        typer.echo(f"listmonk-mcp {get_version()}")
         raise typer.Exit()
 
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled")
 
+    if config_file:
+        load_config(config_file)
+
+    selected = (transport_name or os.environ.get(ENV_TRANSPORT) or "stdio").strip()
+    if selected not in VALID_TRANSPORTS:
+        typer.echo(
+            f"unknown transport {selected!r}; expected one of "
+            f"{', '.join(sorted(VALID_TRANSPORTS))}",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    metrics.set_build_info(get_version(), get_revision())
+
     try:
-        logger.info("Starting Listmonk MCP Server...")
-        # Create the production MCP server with lifespan management
-        server = create_production_server()
-        server.run()
+        logger.info("Starting Listmonk MCP Server (%s)...", selected)
+        if selected == "stdio":
+            # Create the production MCP server with lifespan management
+            create_production_server().run()
+        else:
+            public_addr, metrics_addr = transport.bind_addrs_from_env()
+            asyncio.run(
+                transport.serve(
+                    create_http_app(),
+                    public_addr=public_addr,
+                    metrics_addr=metrics_addr,
+                    log_level=logging.getLevelName(
+                        logging.getLogger().getEffectiveLevel()
+                    ),
+                )
+            )
     except KeyboardInterrupt:
         logger.info("Server shutdown requested")
         raise typer.Exit(0) from None
