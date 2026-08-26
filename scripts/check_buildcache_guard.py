@@ -21,9 +21,9 @@ What does work is running the guard. This script pulls the `docker` job's build
 script out of the YAML, runs it under four refs with `buildctl` stubbed, and
 counts the `--export-cache` arguments it was actually invoked with.
 
-It then re-runs itself against nine deliberately broken variants — three of the
-build script, six of the workflow that reaches it — and requires each to be
-rejected. A check that has never failed is a hypothesis; this one fails on every
+It then re-runs itself against eleven deliberately broken variants — three of
+the build script, eight of the workflow that reaches it — and requires each to
+be rejected. A check that has never failed is a hypothesis; this one fails on every
 CI run, on purpose.
 
 The workflow-level cases exist because the script-level ones are not enough. An
@@ -40,7 +40,13 @@ both leave every ref-level assertion here passing against a workflow that
 builds nothing. A `strategy: matrix` on the `docker` job is the inverse and
 worse: one push becomes N concurrent instances all exporting to the same ref,
 which is the race this file exists for, reintroduced from a direction none of
-the ref-level checks look. Each has a self-test case.
+the ref-level checks look. So does `if: false` on the build step, and on the
+step that runs this file — the last one being the same shape once more, a
+break that removes its own detector. Each has a self-test case.
+
+Not every step-level `if:` is a fault: the registry login carries one, because
+a pull request has no credentials to log in with. Only the two steps that must
+run unconditionally are named.
 """
 
 from __future__ import annotations
@@ -247,6 +253,17 @@ SUPPRESSING_PUSH_FILTERS: Final = (
 # whether the job carrying it was entered.
 UNCONDITIONAL_JOBS: Final = ("python", DOCKER_JOB)
 
+# Steps that must run unconditionally, named per job. A blanket "no step-level
+# `if:` in the docker job" would be wrong: the registry login legitimately
+# carries `if: github.event_name != 'pull_request'`, because a pull request has
+# no credentials to log in with. These two are different — `if: false` on the
+# build step skips the build while this script executes the step's `run:` block
+# regardless, and `if: false` on the guard step stops this file running at all.
+UNCONDITIONAL_STEPS: Final = (
+    (DOCKER_JOB, BUILD_STEP_NAME),
+    ("python", "buildcache guard"),
+)
+
 
 def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
     """Count export sites in the raw YAML, not just the ones a ref reaches."""
@@ -316,6 +333,29 @@ def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
     # same build script under the same ref. On master that is N writers to one
     # cache ref from a single push — the exact race this file exists for, and
     # invisible to every ref-level check here, which executes the script once.
+    for job_name, step_name in UNCONDITIONAL_STEPS:
+        job = (jobs or {}).get(job_name)
+        steps = job.get("steps") if isinstance(job, dict) else None
+        matching = [
+            step
+            for step in (steps or [])
+            if isinstance(step, dict) and step.get("name") == step_name
+        ]
+        if not matching:
+            failures.append(
+                f"{workflow_path.name}: job `{job_name}` has no step named "
+                f"{step_name!r}. If it was renamed, rename it here too rather "
+                "than deleting this check."
+            )
+        elif any("if" in step for step in matching):
+            condition = next(step["if"] for step in matching if "if" in step)
+            failures.append(
+                f"{workflow_path.name}: step {step_name!r} in job `{job_name}` "
+                f"carries `if: {condition!r}`. A false condition skips it while "
+                "this script, which extracts and runs the step's `run:` block "
+                "directly, never reads the condition."
+            )
+
     docker_job = (jobs or {}).get(DOCKER_JOB)
     if isinstance(docker_job, dict) and "strategy" in docker_job:
         failures.append(
@@ -384,6 +424,16 @@ BROKEN_WORKFLOWS: Final[tuple[tuple[str, str, str], ...]] = (
         "matrix multiplying one push into two concurrent exporters",
         "  docker:\n    runs-on:",
         "  docker:\n    strategy:\n      matrix:\n        slot: [1, 2]\n    runs-on:",
+    ),
+    (
+        "build step gated off while its `run:` block still passes every check",
+        "      - name: Build (and push on tag)\n",
+        "      - name: Build (and push on tag)\n        if: false\n",
+    ),
+    (
+        "the guard step itself gated off, so this file stops running on CI",
+        "      - name: buildcache guard\n",
+        "      - name: buildcache guard\n        if: false\n",
     ),
 )
 
