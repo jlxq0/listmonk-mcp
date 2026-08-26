@@ -82,6 +82,12 @@ instance of it:
 
 - **Public listener**, default `0.0.0.0:3000`, carrying the MCP endpoint and a
   health endpoint. This is what the HTTPRoute targets.
+- **The MCP endpoint is `/mcp/`, with the trailing slash.** `POST /mcp` answers
+  `307 Temporary Redirect` to `/mcp/`; Starlette mounts it that way and the
+  redirect is method-preserving, so a client that follows redirects works
+  either way. An HTTPRoute matching the exact path `/mcp` and nothing else
+  routes the redirect and not the session. Verified 2026-08-26 against the
+  released `v0.2.0` image.
 - **Metrics on a separate listener**, default `127.0.0.1:9090`, resolved as
   explicit env, then `{POD_IP}:9090`, then loopback. **It must never default to
   `0.0.0.0`.** The reason is that `/metrics` must not be publicly routable, and
