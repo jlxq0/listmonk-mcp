@@ -5,9 +5,14 @@ is deliberately absent — read the code for that.
 
 ## This is a fork, and the fork question is live
 
-Upstream is `rhnvrm/listmonk-mcp`. Until pull request #2, `master` was
-**byte-identical** to upstream: the fork carried zero divergence, and every
-change made here sat unmerged on `feat/comprehensive-api-coverage`.
+Upstream is `rhnvrm/listmonk-mcp`. **Until pull request #2 merges, `master` is
+byte-identical to upstream** — the fork carries zero divergence, and every
+change made here sits unmerged on `feat/comprehensive-api-coverage`. Verified
+2026-08-26: `origin/master` and `rhnvrm/listmonk-mcp@HEAD` are both `3e1cf0d`.
+
+Read that as present tense until you have checked. Anything built on `master`
+before #2 lands ships upstream's server without the 41 extra tools, and nothing
+about the resulting image says so.
 
 That is worth not losing by accident. **State in every pull request whether the
 change is a patch this fork carries or something to send upstream.** A fork that
