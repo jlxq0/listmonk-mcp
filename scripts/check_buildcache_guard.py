@@ -21,8 +21,8 @@ What does work is running the guard. This script pulls the `docker` job's build
 script out of the YAML, runs it under four refs with `buildctl` stubbed, and
 counts the `--export-cache` arguments it was actually invoked with.
 
-It then re-runs itself against six deliberately broken variants — three of the
-build script, three of the workflow that reaches it — and requires each to be
+It then re-runs itself against eight deliberately broken variants — three of the
+build script, five of the workflow that reaches it — and requires each to be
 rejected. A check that has never failed is a hypothesis; this one fails on every
 CI run, on purpose.
 
@@ -33,6 +33,11 @@ worse fault: the workflow never fires on master, nothing is built, the cache is
 never written, and this script stops running. The check that would have caught
 it is the thing the break disables. Two ways of breaking it found that; one
 would have left the guard looking correct.
+
+The branch list is not the only key with that property. `paths-ignore: ["**"]`
+alongside a correct `branches: [master]`, and `if: false` on the `docker` job,
+both leave every ref-level assertion here passing against a workflow that
+builds nothing. Each has a self-test case.
 """
 
 from __future__ import annotations
@@ -193,8 +198,8 @@ def check_guard(script: str, tmp: Path) -> list[str]:
     return failures
 
 
-def push_branches(workflow_path: Path) -> object:
-    """The `on.push.branches` list, or a sentinel describing why there is none.
+def push_trigger(workflow_path: Path) -> dict[str, object] | str:
+    """The `on.push` mapping, or a string describing why there is none.
 
     PyYAML follows YAML 1.1, where the bare key `on:` is the boolean `True`.
     `document["on"]` raises KeyError and `document.get("on", {})` silently
@@ -208,9 +213,36 @@ def push_branches(workflow_path: Path) -> object:
     push = triggers.get("push")
     if not isinstance(push, dict):
         return "no `on.push` block"
+    return push
+
+
+def push_branches(workflow_path: Path) -> object:
+    """The `on.push.branches` list, or a sentinel describing why there is none."""
+    push = push_trigger(workflow_path)
+    if isinstance(push, str):
+        return push
     if "branches" not in push:
         return "`on.push` has no `branches` filter"
     return push["branches"]
+
+
+# Trigger filters that suppress a run the branch list says will happen. Each
+# leaves `on.push.branches` reading exactly `[master]` while the workflow does
+# not fire, which is the same fault as `branches: [main]` wearing a different
+# key. Named rather than allow-listed, because a new filter key added by
+# Forgejo should be read by a person before it is trusted.
+SUPPRESSING_PUSH_FILTERS: Final = (
+    "paths",
+    "paths-ignore",
+    "branches-ignore",
+    "tags-ignore",
+)
+
+# Jobs that must run unconditionally. A job-level `if:` is evaluated before any
+# step, so `if: false` on `docker` builds nothing while every ref-level check in
+# this script still passes — it runs the build script directly and never asks
+# whether the job carrying it was entered.
+UNCONDITIONAL_JOBS: Final = ("python", DOCKER_JOB)
 
 
 def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
@@ -245,6 +277,37 @@ def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
             f"{DEFAULT_BRANCH}; any other value means the workflow never runs "
             "on it, so nothing is built and this guard never executes."
         )
+
+    # A correct branch list is not enough: `paths-ignore: ["**"]` alongside it
+    # filters out every master push while `branches` still reads `[master]`.
+    push = push_trigger(workflow_path)
+    if isinstance(push, dict):
+        for key in SUPPRESSING_PUSH_FILTERS:
+            if key in push:
+                failures.append(
+                    f"{workflow_path.name}: on.push carries `{key}: "
+                    f"{push[key]!r}`. It can suppress a push to "
+                    f"{DEFAULT_BRANCH} that the branch list says will run, "
+                    "which leaves every check in this script passing against a "
+                    "workflow that never fires."
+                )
+
+    document = yaml.safe_load(text)
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    for job_name in UNCONDITIONAL_JOBS:
+        job = (jobs or {}).get(job_name)
+        if not isinstance(job, dict):
+            failures.append(
+                f"{workflow_path.name}: no `{job_name}` job. If it was renamed, "
+                "rename it here too rather than deleting this check."
+            )
+        elif "if" in job:
+            failures.append(
+                f"{workflow_path.name}: job `{job_name}` carries `if: "
+                f"{job['if']!r}`. A job-level condition is evaluated before any "
+                "step, so a false one skips the build while this script — which "
+                "runs the build script directly — still passes."
+            )
 
     return failures
 
@@ -290,6 +353,16 @@ BROKEN_WORKFLOWS: Final[tuple[tuple[str, str, str], ...]] = (
         "push trigger's branch filter dropped entirely",
         "    branches: [master]\n",
         "",
+    ),
+    (
+        "path filter suppressing every push the branch list admits",
+        "    branches: [master]\n",
+        '    branches: [master]\n    paths-ignore: ["**"]\n',
+    ),
+    (
+        "docker job gated off while every ref-level check still passes",
+        "  docker:\n    runs-on:",
+        "  docker:\n    if: false\n    runs-on:",
     ),
 )
 
