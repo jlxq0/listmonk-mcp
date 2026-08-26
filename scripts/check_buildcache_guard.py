@@ -21,8 +21,8 @@ What does work is running the guard. This script pulls the `docker` job's build
 script out of the YAML, runs it under four refs with `buildctl` stubbed, and
 counts the `--export-cache` arguments it was actually invoked with.
 
-It then re-runs itself against eight deliberately broken variants — three of the
-build script, five of the workflow that reaches it — and requires each to be
+It then re-runs itself against nine deliberately broken variants — three of the
+build script, six of the workflow that reaches it — and requires each to be
 rejected. A check that has never failed is a hypothesis; this one fails on every
 CI run, on purpose.
 
@@ -37,7 +37,10 @@ would have left the guard looking correct.
 The branch list is not the only key with that property. `paths-ignore: ["**"]`
 alongside a correct `branches: [master]`, and `if: false` on the `docker` job,
 both leave every ref-level assertion here passing against a workflow that
-builds nothing. Each has a self-test case.
+builds nothing. A `strategy: matrix` on the `docker` job is the inverse and
+worse: one push becomes N concurrent instances all exporting to the same ref,
+which is the race this file exists for, reintroduced from a direction none of
+the ref-level checks look. Each has a self-test case.
 """
 
 from __future__ import annotations
@@ -309,6 +312,19 @@ def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
                 "runs the build script directly — still passes."
             )
 
+    # A matrix multiplies one job into N concurrent instances, each running the
+    # same build script under the same ref. On master that is N writers to one
+    # cache ref from a single push — the exact race this file exists for, and
+    # invisible to every ref-level check here, which executes the script once.
+    docker_job = (jobs or {}).get(DOCKER_JOB)
+    if isinstance(docker_job, dict) and "strategy" in docker_job:
+        failures.append(
+            f"{workflow_path.name}: job `{DOCKER_JOB}` carries a `strategy:` "
+            "block. A matrix runs it once per combination, concurrently, all "
+            "exporting to the same ref from one push. If a matrix is genuinely "
+            "wanted, the cache ref has to be qualified per combination first."
+        )
+
     return failures
 
 
@@ -363,6 +379,11 @@ BROKEN_WORKFLOWS: Final[tuple[tuple[str, str, str], ...]] = (
         "docker job gated off while every ref-level check still passes",
         "  docker:\n    runs-on:",
         "  docker:\n    if: false\n    runs-on:",
+    ),
+    (
+        "matrix multiplying one push into two concurrent exporters",
+        "  docker:\n    runs-on:",
+        "  docker:\n    strategy:\n      matrix:\n        slot: [1, 2]\n    runs-on:",
     ),
 )
 
