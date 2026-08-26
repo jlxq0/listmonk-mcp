@@ -127,13 +127,18 @@ class StubListmonk:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}"
 
-    def last(self, method: str, path_contains: str) -> RecordedRequest:
+    def last(self, method: str, path: str) -> RecordedRequest:
+        """The most recent request to exactly ``path``.
+
+        Exact, not substring: `"/api/settings" in "/api/settings/foo"` is true,
+        so a substring match would let a correct body sent to the wrong
+        endpoint pass the per-key/bulk distinction these tests draw.
+        """
         for recorded in reversed(self.requests):
-            if recorded.method == method and path_contains in recorded.path:
+            if recorded.method == method and recorded.path == path:
                 return recorded
         raise AssertionError(
-            f"no {method} to a path containing {path_contains!r}; "
-            f"saw {self.requests!r}"
+            f"no {method} to {path!r}; saw {self.requests!r}"
         )
 
 
@@ -246,8 +251,8 @@ class TestUpdateSettingSendsRawValue:
 
     @pytest.mark.parametrize(
         "value",
-        [42, True, False, None, ["a", "b"], {"nested": "object"}],
-        ids=["int", "true", "false", "null", "array", "object"],
+        [42, True, False, ["a", "b"], {"nested": "object"}],
+        ids=["int", "true", "false", "array", "object"],
     )
     async def test_non_string_values_are_not_wrapped_either(
         self, client: ListmonkClient, stub: StubListmonk, value: Any
@@ -255,11 +260,39 @@ class TestUpdateSettingSendsRawValue:
         async with client:
             await client.update_setting("some.key", value)
 
+        recorded = stub.last("PUT", "/api/settings/some.key")
+
         # Mutation: as above. The `{"nested": "object"}` case is the one that
         # makes the wrapper invisible to a naive assertion — a wrapped body is
         # also a JSON object, so asserting only "the body is a dict" would stay
         # green against the bug.
-        assert stub.last("PUT", "/api/settings/some.key").json == value
+        assert recorded.json == value
+
+        # The bytes, not just the decoded value: `True == 1` and `False == 0`
+        # in Python, so a regression serialising booleans as integers would
+        # leave the assertion above green on exactly the two cases where
+        # listmonk cares about the difference. json.dumps(True) is "true".
+        # Compact separators are httpx's, not a choice made here.
+        assert recorded.raw_body == json.dumps(
+            value, separators=(",", ":")
+        ).encode()
+
+    async def test_a_null_value_sends_an_empty_body(
+        self, client: ListmonkClient, stub: StubListmonk
+    ) -> None:
+        """Pins a limitation, not a fix: `None` is not expressible as `null`.
+
+        httpx reads `json=None` as "no JSON body" rather than as the JSON value
+        `null`, so `update_setting(key, None)` sends nothing at all and
+        listmonk's UpdateSettingsByKey binds an empty RawMessage. Whether any
+        setting needs a null is a question for someone with the settings
+        document in front of them; this records what happens today so that a
+        change to it is visible rather than discovered.
+        """
+        async with client:
+            await client.update_setting("some.key", None)
+
+        assert stub.last("PUT", "/api/settings/some.key").raw_body == b""
 
     async def test_full_settings_put_still_sends_the_mapping(
         self, client: ListmonkClient, stub: StubListmonk
