@@ -21,10 +21,10 @@ What does work is running the guard. This script pulls the `docker` job's build
 script out of the YAML, runs it under four refs with `buildctl` stubbed, and
 counts the `--export-cache` arguments it was actually invoked with.
 
-It then re-runs itself against eleven deliberately broken variants — three of
-the build script, eight of the workflow that reaches it — and requires each to
-be rejected. A check that has never failed is a hypothesis; this one fails on every
-CI run, on purpose.
+It then re-runs itself against fourteen deliberately broken variants — three of
+the build script, eleven of the workflow that reaches it — and requires each to
+be rejected. A check that has never failed is a hypothesis; this one fails on
+every CI run, on purpose.
 
 The workflow-level cases exist because the script-level ones are not enough. An
 export guard reading `refs/heads/main` is caught; a push trigger reading
@@ -47,6 +47,13 @@ break that removes its own detector. Each has a self-test case.
 Not every step-level `if:` is a fault: the registry login carries one, because
 a pull request has no credentials to log in with. Only the two steps that must
 run unconditionally are named.
+
+Naming faults one at a time does not terminate. Four cross-engine passes over
+this file produced four different keys and each fix invited the next, so the
+last check is fail-closed rather than specific: the workflow may carry the keys
+it carries today and nothing else, and a new one is a failure until someone has
+read it. The named checks above are kept for what they explain, not for what
+they catch.
 """
 
 from __future__ import annotations
@@ -264,6 +271,25 @@ UNCONDITIONAL_STEPS: Final = (
     ("python", "buildcache guard"),
 )
 
+# Naming faults one at a time does not terminate. Four cross-engine passes over
+# this file produced four different keys — `paths-ignore`, a job `if:`, a
+# `strategy:` matrix, a step `if:` — and each fix invited the next. The keys
+# that decide whether a job runs, or how many times, are an open set, and a new
+# Forgejo release can add one.
+#
+# So the shape below is fail-closed: these are the keys the workflow carries
+# today, and anything else is a failure until a person has read it and either
+# ruled it harmless here or written the specific check. `needs: nonexistent`
+# never schedules the docker job and is a key that already exists, which is why
+# the value is pinned and not only the key.
+ALLOWED_JOB_KEYS: Final = {
+    "python": {"runs-on", "steps"},
+    DOCKER_JOB: {"needs", "permissions", "runs-on", "steps"},
+}
+DOCKER_NEEDS: Final = "python"
+ALLOWED_PUSH_KEYS: Final = {"branches", "tags"}
+ALLOWED_STEP_KEYS: Final = {"name", "run"}
+
 
 def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
     """Count export sites in the raw YAML, not just the ones a ref reaches."""
@@ -365,6 +391,72 @@ def check_static(workflow_path: Path = WORKFLOW) -> list[str]:
             "wanted, the cache ref has to be qualified per combination first."
         )
 
+    failures += check_no_unread_keys(workflow_path.name, push, jobs)
+
+    return failures
+
+
+def check_no_unread_keys(
+    name: str, push: dict[str, object] | str, jobs: object
+) -> list[str]:
+    """Fail on any key nobody has read, rather than on a list of known faults.
+
+    The named checks above each say why one key is dangerous. This one says
+    nothing about danger: it says the workflow has grown a key that no check
+    here understands, and a check that does not understand a key cannot vouch
+    for it.
+    """
+    failures: list[str] = []
+
+    if isinstance(push, dict):
+        unread = set(push) - ALLOWED_PUSH_KEYS
+        if unread:
+            failures.append(
+                f"{name}: on.push carries unread key(s) {sorted(unread)}. "
+                "Trigger filters decide whether a push to master runs at all, "
+                "and nothing here knows what this one does. Read it, then "
+                "either allow it explicitly or write the check."
+            )
+
+    for job_name, allowed in ALLOWED_JOB_KEYS.items():
+        job = (jobs or {}).get(job_name) if isinstance(jobs, dict) else None
+        if not isinstance(job, dict):
+            continue  # already reported as a missing job
+        unread = set(job) - allowed
+        if unread:
+            failures.append(
+                f"{name}: job `{job_name}` carries unread key(s) "
+                f"{sorted(unread)}. Job-level keys decide whether it runs and "
+                "how many instances of it run, which is the whole subject of "
+                "this file."
+            )
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            if step.get("name") not in {
+                step_name
+                for owner, step_name in UNCONDITIONAL_STEPS
+                if owner == job_name
+            }:
+                continue
+            unread_step = set(step) - ALLOWED_STEP_KEYS
+            if unread_step:
+                failures.append(
+                    f"{name}: step {step.get('name')!r} in job `{job_name}` "
+                    f"carries unread key(s) {sorted(unread_step)}. This script "
+                    "runs the step's `run:` block and reads nothing else about "
+                    "it, so anything else on the step is unchecked."
+                )
+
+    docker_job = (jobs or {}).get(DOCKER_JOB) if isinstance(jobs, dict) else None
+    if isinstance(docker_job, dict) and docker_job.get("needs") != DOCKER_NEEDS:
+        failures.append(
+            f"{name}: job `{DOCKER_JOB}` needs {docker_job.get('needs')!r}, "
+            f"expected {DOCKER_NEEDS!r}. A `needs:` naming a job that does not "
+            "exist is never scheduled, so the build silently does not happen "
+            "while every other check here passes."
+        )
+
     return failures
 
 
@@ -434,6 +526,21 @@ BROKEN_WORKFLOWS: Final[tuple[tuple[str, str, str], ...]] = (
         "the guard step itself gated off, so this file stops running on CI",
         "      - name: buildcache guard\n",
         "      - name: buildcache guard\n        if: false\n",
+    ),
+    (
+        "docker job waiting on a job that does not exist",
+        "    needs: python\n",
+        "    needs: nonexistent\n",
+    ),
+    (
+        "a job-level key no check here has read",
+        "    needs: python\n",
+        "    needs: python\n    continue-on-error: true\n",
+    ),
+    (
+        "a trigger filter no check here has read",
+        "    branches: [master]\n",
+        "    branches: [master]\n    types: [deleted]\n",
     ),
 )
 
