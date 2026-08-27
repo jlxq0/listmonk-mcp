@@ -156,6 +156,31 @@ canned JSON is enough to exercise both transports end to end.
 
 Each of these shipped broken at least once, or would have.
 
+**`master` requires `CI / python*` and deliberately not `CI / docker`.** A job
+skipped because the job it `needs:` failed posts **`success`** to the commit
+status. Measured here on `e005d4b`, a throwaway branch carrying one failing
+test:
+
+    CI / python (pull_request) = failure
+    CI / docker (pull_request) = success     <- no docker task existed for that run
+
+`docker` carries `needs: python`, so requiring it would build a gate that is
+green precisely when the work did not happen — the same shape as a guard that
+passes because the workflow it guards no longer runs.
+
+**The glob is load-bearing.** The context carries an event suffix,
+`(pull_request)` on a pull-request head and `(push)` on a branch push, so a
+literal `CI / python (pull_request)` matches one and silently never matches the
+other.
+
+**What excluding `docker` costs, stated rather than discovered.** A genuine
+docker failure no longer blocks a merge, and this repository has had exactly
+one: `d74a768` merged with `python` green and `docker` red, the missing
+`FORGE_PUSH_TOKEN` above. That failure is loud on `master` and reaches the
+release tag, so it is caught by someone reading the run rather than by the
+gate. Requiring the context that reports `success` when skipped would not have
+caught it either — it would have hidden the next one.
+
 **The declared Python floor is type-checked and never run.** `pyproject`
 declares `requires-python = ">=3.11"`; `.python-version` pins 3.13, uv honours
 it, and the Dockerfile pins `python:3.13-slim-bookworm` by digest, so CI and
